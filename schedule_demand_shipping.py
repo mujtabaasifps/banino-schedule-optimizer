@@ -167,12 +167,13 @@ def build_packaging_change_matrix(skus: Dict[str, SKU]) -> Dict[str, Dict[str, f
 
 def build_sku_rate_map(skus: Dict[str, SKU]) -> Dict[str, float]:
     """
-    Per-SKU rate (bars/hour) from 720 bars/min baseline (43,200 bars/h) and OE by pack:
+    Per-SKU rate (magnums/hour) from 720 magnums/min baseline
+    (43,200 magnums/h) and OE by pack:
       - 3MP → OE 0.80
       - 4MP → OE 0.85
       - 6MP → OE 0.85
     """
-    nominal_bars_per_hour = 720.0 * 60.0  # 43,200
+    nominal_units_per_hour = 720.0 * 60.0  # 43,200
     rate_map: Dict[str, float] = {}
     for code, sku in skus.items():
         nm = sku.name
@@ -184,7 +185,7 @@ def build_sku_rate_map(skus: Dict[str, SKU]) -> Dict[str, float]:
             oe = 0.85
         else:
             oe = 0.85
-        rate_map[code] = nominal_bars_per_hour * oe
+        rate_map[code] = nominal_units_per_hour * oe
     return rate_map
 
 
@@ -393,7 +394,7 @@ def simulate_weekly_schedule_with_inventory(
     Returns:
       - timeline: list of events
       - total_hours: final time (<= time_limit_h)
-      - bars_by_sku: dict sku -> total bars actually produced
+      - units_by_sku: dict sku -> total Magnums/units actually produced
     """
     timeline: List[Dict[str, Any]] = []
     current = 0.0
@@ -494,7 +495,7 @@ def simulate_weekly_schedule_with_inventory(
         res_last_clean[rname] = current
 
     last_sku: Optional[str] = None
-    bars_by_sku: Dict[str, float] = {sku: 0.0 for sku in sku_order}
+    units_by_sku: Dict[str, float] = {sku: 0.0 for sku in sku_order}
 
     # Simulate week-by-week, but stop when time_limit_h is reached
     for week_idx in range(weeks):
@@ -603,7 +604,7 @@ def simulate_weekly_schedule_with_inventory(
             insert_periodic()
             if time_exhausted or current >= time_limit_h - eps:
                 # We've used up horizon during/after production
-                bars_by_sku[sku] += weekly_qty  # produced full weekly demand
+                units_by_sku[sku] += weekly_qty  # produced full weekly demand
                 last_sku = sku
                 break
 
@@ -611,7 +612,7 @@ def simulate_weekly_schedule_with_inventory(
                 res_run[rname] += run
                 res_last_active[rname] = current
 
-            bars_by_sku[sku] += weekly_qty
+            units_by_sku[sku] += weekly_qty
             last_sku = sku
 
         if time_exhausted or current >= time_limit_h - eps:
@@ -625,7 +626,7 @@ def simulate_weekly_schedule_with_inventory(
             'end': current + 6.0
         })
         current += 6.0
-    # try end-of-production procedures
+    # End-of-production procedures
     if can_add(0.5):
         timeline.append({
             'task': 'End of production procedures',
@@ -635,7 +636,7 @@ def simulate_weekly_schedule_with_inventory(
         current += 0.5
 
     total_hours = min(current, time_limit_h)
-    return timeline, total_hours, bars_by_sku
+    return timeline, total_hours, units_by_sku
 
 
 # ------------------------------
@@ -665,7 +666,7 @@ def grid_search_inventory_vs_horizon_to_csv(
         the horizon is tight.
     """
     transition_headers = _all_transition_headers(order_candidates, sku_order)
-    per_sku_bars_headers = [f"bars_{sku}" for sku in sku_order]
+    per_sku_units_headers = [f"units_{sku}" for sku in sku_order]
     per_sku_time_headers = [f"prod_time_{sku}_h" for sku in sku_order]
 
     summary_headers = [
@@ -673,12 +674,12 @@ def grid_search_inventory_vs_horizon_to_csv(
         "schedule_id",
         "sequence",
         "scale_of_demand",     # produced / planned demand over horizon
-        "total_bars",
+        "total_magnums",
         "total_hours",
         "PreProduction","Production","Changeover","Packaging",
         "RoutineSan","WeeklySan","FortnightlySan","ResourceCleaning",
         "PostProduction","Other",
-    ] + per_sku_bars_headers + per_sku_time_headers + transition_headers
+    ] + per_sku_units_headers + per_sku_time_headers + transition_headers
 
     events_headers = [
         "time_horizon_h",
@@ -700,7 +701,7 @@ def grid_search_inventory_vs_horizon_to_csv(
 
             for sid, order in enumerate(order_candidates, start=1):
                 # 1) simulate week-by-week schedule with HARD time limit
-                timeline, total_h, bars_by_sku = simulate_weekly_schedule_with_inventory(
+                timeline, total_h, units_by_sku = simulate_weekly_schedule_with_inventory(
                     order,
                     sku_order,
                     weekly_demand,
@@ -718,13 +719,13 @@ def grid_search_inventory_vs_horizon_to_csv(
                 states = _summarize_timeline_simple(timeline)
                 trans_cols = _transition_durations_after_each_product(order, sku_order, timeline)
 
-                total_bars = sum(bars_by_sku.values())
+                total_units = sum(units_by_sku.values())
                 total_demand_horizon = sum(weekly_demand[s] * weeks for s in sku_order)
-                scale_of_demand = (total_bars / total_demand_horizon) if total_demand_horizon > 0 else 0.0
+                scale_of_demand = (total_units / total_demand_horizon) if total_demand_horizon > 0 else 0.0
 
-                # per-SKU production times from bars_by_sku & rates
+                # per-SKU production times from units_by_sku & rates
                 time_by_sku = {
-                    sku: (bars_by_sku[sku] / rate_map[sku]) if rate_map[sku] > 0 else 0.0
+                    sku: (units_by_sku[sku] / rate_map[sku]) if rate_map[sku] > 0 else 0.0
                     for sku in sku_order
                 }
 
@@ -734,7 +735,7 @@ def grid_search_inventory_vs_horizon_to_csv(
                     sid,
                     " -> ".join(sku_order[i] for i in order),
                     round(scale_of_demand, 6),
-                    round(total_bars, 3),
+                    round(total_units, 3),
                     round(total_h, 3),
                     round(states.get("PreProduction", 0.0), 3),
                     round(states.get("Production", 0.0), 3),
@@ -748,8 +749,8 @@ def grid_search_inventory_vs_horizon_to_csv(
                     round(states.get("Other", 0.0), 3),
                 ]
 
-                # per-SKU bars
-                row += [round(bars_by_sku.get(sku, 0.0), 3) for sku in sku_order]
+                # per-SKU units
+                row += [round(units_by_sku.get(sku, 0.0), 3) for sku in sku_order]
                 # per-SKU production time
                 row += [round(time_by_sku.get(sku, 0.0), 3) for sku in sku_order]
                 # transition columns
@@ -784,10 +785,10 @@ def main() -> None:
     tasks_description = build_tasks_description()
     packaging_change = build_packaging_change_matrix(skus)
 
-    # Per-SKU rates from 720 bars/min + OE by pack size
+    # Per-SKU rates from 720 magnums/min + OE by pack size
     rate_map = build_sku_rate_map(skus)
 
-    # Nominal 6-week capacity-based demand profile
+    # Nominal 6-week capacity-based demand profile (in Magnums/units)
     demand_6w = build_6week_demand_from_capacity(rate_map, horizon_weeks=6.0, utilisation=None)
 
     # Convert to weekly demand
@@ -838,7 +839,7 @@ def main() -> None:
         6,   # 6 weeks
         12,  # 12 weeks
         24,  # 24 weeks
-        48,  # 48 weeks
+        #48,  # 48 weeks
         52,  # 52 weeks
     ]
 

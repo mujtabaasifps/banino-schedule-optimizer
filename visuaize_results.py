@@ -5,11 +5,11 @@ visualise_grid_results_exec.py
 Exec-friendly visualisations:
 
   - normalised_total_bars_top5_all_horizons.png
-      -> absolute total bars, with labels and % vs best.
+      -> absolute total Magnums/units (was 'bars'), with labels and % vs best.
   - time_breakdown_states_top5_all_horizons.png
       -> absolute hours by STATE BUCKET (not normalised).
   - relative_gain_top5_all_horizons.png
-      -> single bar per horizon: best vs average and best vs worst.
+      -> single bar per horizon: best vs average and best vs worst (Magnums).
   - gantt_top5_horizon_{H}h.png
       -> Gantt with grouped TASK BUCKETS (production / changeovers /
          wrapper changes / daily / weekly / fortnightly / pre-post / other).
@@ -88,7 +88,6 @@ SHORT_GROUP_LABELS = {
     "Other": "OT",                          # Other
 }
 
-
 # thresholds for inline text (in hours)
 PROD_ANNOT_THRESHOLD = 24.0      # label SKU if production run ≥ 1 day
 NONPROD_ANNOT_THRESHOLD = 4.0    # label cleaning blocks if ≥ 4h
@@ -111,12 +110,30 @@ def load_data():
     return summary, events
 
 
+def get_total_col(df: pd.DataFrame) -> str:
+    """
+    Decide which total output column to use:
+    - Prefer 'total_magnums' (new naming)
+    - Fall back to 'total_bars' for backward compatibility
+    """
+    if "total_magnums" in df.columns:
+        return "total_magnums"
+    if "total_bars" in df.columns:
+        return "total_bars"
+    raise ValueError(
+        "Summary CSV must contain either 'total_magnums' or 'total_bars'."
+    )
+
+
 def add_schedule_ranks(summary: pd.DataFrame) -> pd.DataFrame:
     summary = summary.copy()
-    if not {"time_horizon_h", "total_bars"}.issubset(summary.columns):
-        raise ValueError("Missing required columns in summary CSV.")
+    if "time_horizon_h" not in summary.columns:
+        raise ValueError("Missing 'time_horizon_h' column in summary CSV.")
+
+    total_col = get_total_col(summary)
+
     summary["schedule_rank"] = (
-        summary.groupby("time_horizon_h")["total_bars"]
+        summary.groupby("time_horizon_h")[total_col]
         .rank(method="first", ascending=False)
         .astype(int)
     )
@@ -182,15 +199,17 @@ def map_task_to_group(task: str) -> str:
 
 
 # ---------------------------------------------------------------------
-# Plot 1: Total bars (absolute)
+# Plot 1: Total Magnums (absolute)
 # ---------------------------------------------------------------------
 def plot_total_bars_top5(summary: pd.DataFrame):
+    total_col = get_total_col(summary)
+
     horizons = sorted(summary["time_horizon_h"].unique())
     n = len(horizons)
-    cols = min(3, n)
+    cols = min(2, n)
     rows = math.ceil(n / cols)
 
-    fig, axes = plt.subplots(rows, cols, figsize=(7 * cols, 4.5 * rows), squeeze=False)
+    fig, axes = plt.subplots(rows, cols, figsize=(7 * cols, 7 * rows), squeeze=False)
     axes_flat = axes.flatten()
 
     for ax, horizon in zip(axes_flat, horizons):
@@ -206,17 +225,24 @@ def plot_total_bars_top5(summary: pd.DataFrame):
             continue
 
         x = np.arange(len(grp))
-        totals = grp["total_bars"].values
+        totals = grp[total_col].values
         best = totals.max()
 
         bars = ax.bar(x, totals, color="#1f77b4")
-        ax.set_title(f"Horizon = {int(horizon)} h", fontsize=11)
+
+        # -------------------------------
+        # Add padding above tallest bar
+        # -------------------------------
+        ax.set_ylim(top=best * 1.12)
+
+        ax.set_title(f"Horizon = {int(horizon / 168)} weeks", fontsize=11)
         ax.set_xticks(x)
         ax.set_xticklabels([f"#{r}" for r in grp["schedule_rank"]], fontsize=8)
-        ax.set_ylabel("Total bars (millions)")
+        ax.set_ylabel("Total Magnums (millions)")
         ax.yaxis.set_major_formatter(FuncFormatter(lambda v, p: f"{v/1e6:.2f}M"))
         ax.grid(axis="y", alpha=0.3)
 
+        # Labels on each bar
         for bar, sched_id, total in zip(bars, grp["schedule_id"], totals):
             pct_vs_best = (total / best - 1) * 100 if best > 0 else 0
             ax.text(
@@ -228,10 +254,10 @@ def plot_total_bars_top5(summary: pd.DataFrame):
                 fontsize=7,
             )
 
-    for ax in axes_flat[len(horizons) :]:
+    for ax in axes_flat[len(horizons):]:
         ax.axis("off")
 
-    fig.suptitle("Total Bars – Top 5 Schedules per Horizon", fontsize=14)
+    fig.suptitle("Total Magnums – Top 5 Schedules per Horizon", fontsize=14)
     fig.tight_layout(rect=[0, 0.03, 1, 0.95])
     fname = os.path.join(OUTPUT_DIR, "normalised_total_bars_top5_all_horizons.png")
     fig.savefig(fname, dpi=200)
@@ -245,11 +271,14 @@ def plot_total_bars_top5(summary: pd.DataFrame):
 def plot_state_breakdown_top5(summary: pd.DataFrame):
     horizons = sorted(summary["time_horizon_h"].unique())
     n = len(horizons)
-    cols = min(3, n)
+    cols = min(2, n)
     rows = math.ceil(n / cols)
 
-    fig, axes = plt.subplots(rows, cols, figsize=(7 * cols, 4.5 * rows), squeeze=False)
+    fig, axes = plt.subplots(rows, cols, figsize=(7 * cols, 7 * rows), squeeze=False)
     axes_flat = axes.flatten()
+
+    state_names = list(STATE_BUCKETS.keys())
+    num_buckets = len(state_names)
 
     for ax, horizon in zip(axes_flat, horizons):
         grp = (
@@ -263,40 +292,83 @@ def plot_state_breakdown_top5(summary: pd.DataFrame):
             ax.axis("off")
             continue
 
+        # Hours per state bucket
         bucket_df = grp.apply(bucketize_state_row, axis=1)
-        x = np.arange(len(grp))
-        bottom = np.zeros(len(grp))
 
-        for bucket, _cols in STATE_BUCKETS.items():
-            if bucket not in bucket_df.columns:
+        # Total time per schedule
+        total_time = bucket_df.sum(axis=1).replace(0, np.nan)
+
+        # Normalised to % of total time
+        bucket_pct = bucket_df.div(total_time, axis=0) * 100.0
+
+        x = np.arange(len(grp))  # one group per schedule
+        bar_width = 0.12
+        offset = (num_buckets - 1) / 2.0
+
+        production_positions = None
+        production_values = None
+
+        # Plot grouped bars: one bar per state bucket per schedule
+        for b_idx, bucket in enumerate(state_names):
+            if bucket not in bucket_pct.columns:
                 continue
-            vals = bucket_df[bucket].values
+
+            vals = bucket_pct[bucket].values
+            positions = x + (b_idx - offset) * bar_width
+
             ax.bar(
-                x,
+                positions,
                 vals,
-                bottom=bottom,
+                width=bar_width,
                 label=bucket,
                 color=BUCKET_COLORS.get(bucket, "#7f7f7f"),
+                alpha=0.9 if bucket == "Production" else 0.7,
             )
-            bottom += vals
 
-        ax.set_title(f"Horizon = {int(horizon)} h (Top 5)", fontsize=11)
+            # Remember production bars for annotation
+            if bucket == "Production":
+                production_positions = positions
+                production_values = vals
+
+        ax.set_title(f"Horizon = {int(horizon / 168)} weeks (Top 5)", fontsize=11)
         ax.set_xticks(x)
         ax.set_xticklabels(
             [f"#{r}\nS{int(s)}" for r, s in zip(grp["schedule_rank"], grp["schedule_id"])],
             fontsize=7,
         )
-        ax.set_ylabel("Hours")
-        ax.yaxis.set_major_formatter(FuncFormatter(lambda v, p: f"{v:.2f}"))
+        ax.set_ylabel("Share of time [%]")
+        ax.yaxis.set_major_formatter(FuncFormatter(lambda v, p: f"{v:.1f}"))
         ax.grid(axis="y", alpha=0.3)
 
-    for ax in axes_flat[len(horizons) :]:
+        # Headroom so annotations don't clip
+        ymax = bucket_pct.max().max() * 1.12
+        ax.set_ylim(top=ymax)
+
+        # Annotate production bars with % and Δ vs best (if we have them)
+        if production_positions is not None and production_values is not None:
+            best_prod_pct = np.nanmax(production_values)
+            for pos, pct in zip(production_positions, production_values):
+                delta_pp = pct - best_prod_pct  # best = 0, others negative
+                ax.text(
+                    pos,
+                    pct,
+                    f"{pct:.1f}%\n{delta_pp:+.1f} pp",
+                    ha="center",
+                    va="bottom",
+                    fontsize=7,
+                )
+
+    # Hide unused axes
+    for ax in axes_flat[len(horizons):]:
         ax.axis("off")
 
+    # Legend (state buckets)
     handles, labels = axes_flat[0].get_legend_handles_labels()
     fig.legend(handles, labels, loc="upper right", title="State bucket", fontsize=8)
+
     fig.suptitle(
-        "Time Breakdown by State (Hours) – Top 5 Schedules per Horizon", fontsize=14
+        "Time Breakdown by State (% of total time) – Top 5 Schedules per Horizon",
+        fontsize=14,
     )
     fig.tight_layout(rect=[0, 0.05, 1, 0.95])
     fname = os.path.join(OUTPUT_DIR, "time_breakdown_states_top5_all_horizons.png")
@@ -305,46 +377,79 @@ def plot_state_breakdown_top5(summary: pd.DataFrame):
     print("[saved]", fname)
 
 
+
 # ---------------------------------------------------------------------
-# Plot 3: Relative gain summary
+# Plot 3: Relative gain summary (Magnums)
 # ---------------------------------------------------------------------
 def plot_relative_gain_summary(summary: pd.DataFrame):
+    total_col = get_total_col(summary)
+
     rows = []
     for horizon, grp in summary.groupby("time_horizon_h"):
         grp = grp.copy()
-        best = grp["total_bars"].max()
-        worst = grp["total_bars"].min()
-        avg = grp["total_bars"].mean()
+
+        # Sort schedules by performance (Magnums)
+        grp_sorted = grp.sort_values(total_col, ascending=False)
+
+        best = grp_sorted[total_col].iloc[0]
+        # "Next best" = 2nd schedule, or same as best if only one schedule exists
+        next_best = grp_sorted[total_col].iloc[1] if len(grp_sorted) > 1 else best
+
+        worst = grp_sorted[total_col].min()
+        avg = grp_sorted[total_col].mean()
+
+        gain_vs_next = (best - next_best) / next_best * 100 if next_best > 0 else 0
         gain_vs_avg = (best - avg) / avg * 100 if avg > 0 else 0
         gain_vs_worst = (best - worst) / worst * 100 if worst > 0 else 0
+
         rows.append(
             {
                 "time_horizon_h": horizon,
+                "gain_vs_next_pct": gain_vs_next,
                 "gain_vs_avg_pct": gain_vs_avg,
                 "gain_vs_worst_pct": gain_vs_worst,
             }
         )
+
     df = pd.DataFrame(rows).sort_values("time_horizon_h")
 
     if df.empty:
         return
 
     x = np.arange(len(df))
-    width = 0.35
+    width = 0.25  # thinner bars now that we have 3 per group
 
     fig, ax = plt.subplots(figsize=(10, 5))
-    bars1 = ax.bar(x - width / 2, df["gain_vs_avg_pct"], width, label="Best vs Avg")
-    bars2 = ax.bar(x + width / 2, df["gain_vs_worst_pct"], width, label="Best vs Worst")
+
+    bars_next = ax.bar(
+        x - width,
+        df["gain_vs_next_pct"],
+        width,
+        label="Best vs 2nd best",
+    )
+    bars_avg = ax.bar(
+        x,
+        df["gain_vs_avg_pct"],
+        width,
+        label="Best vs Avg",
+    )
+    bars_worst = ax.bar(
+        x + width,
+        df["gain_vs_worst_pct"],
+        width,
+        label="Best vs Worst",
+    )
 
     ax.set_xticks(x)
-    ax.set_xticklabels([f"{int(h)}h" for h in df["time_horizon_h"]])
+    ax.set_xticklabels([f"{int(h / 168)} weeks" for h in df["time_horizon_h"]])
     ax.set_ylabel("Gain [%]")
-    ax.set_title("Relative Gain of Best Schedule (per Horizon)")
+    ax.set_title("Relative Gain of Best Schedule (Magnums) per Horizon")
     ax.yaxis.set_major_formatter(FuncFormatter(lambda v, p: f"{v:.2f}"))
     ax.grid(axis="y", alpha=0.3)
     ax.legend()
 
-    for bars in (bars1, bars2):
+    # Annotate all three bar groups
+    for bars in (bars_next, bars_avg, bars_worst):
         for bar in bars:
             h = bar.get_height()
             ax.text(
@@ -363,25 +468,37 @@ def plot_relative_gain_summary(summary: pd.DataFrame):
     print("[saved]", fname)
 
 
+SKU_COLORS = {
+    "B3":  "#1f77b4",
+    "B4":  "#ff7f0e",
+    "Bm":  "#2ca02c",
+    "CAB": "#9467bd",
+    "S3":  "#8c564b",
+    "S4":  "#e377c2",
+    "Sm":  "#7f7f7f",
+    "C":   "#bcbd22",
+    "Ch3": "#17becf",
+    "Ch4": "#aec7e8",
+    "Hm":  "#ffbb78",
+}
+
 # ---------------------------------------------------------------------
 # Plot 4: Gantt – grouped task buckets, with spacing & inline labels
 # ---------------------------------------------------------------------
 def plot_gantt_top5(summary: pd.DataFrame, events: pd.DataFrame):
     """
-    One figure per horizon:
-        - Subplots = one per schedule (top K)
-        - Rows = task groups
-        - Bars = events in correct row/time
-        - Colors = task groups (consistent across all)
-        - Inline annotation:
-              - SKU for long production runs
-              - Initials for long non-production tasks
+    Same as before, but:
+      - Production bars colored per SKU (using SKU_COLORS)
+      - Other task groups keep existing colors
+      - No inline annotations
+      - Y-labels unchanged
     """
+
+    total_col = get_total_col(summary)
     horizons = sorted(summary["time_horizon_h"].unique())
 
     for horizon in horizons:
 
-        # --- Top K schedules ---
         grp = (
             summary[summary["time_horizon_h"] == horizon]
             .copy()
@@ -392,27 +509,21 @@ def plot_gantt_top5(summary: pd.DataFrame, events: pd.DataFrame):
             continue
 
         sched_ids = grp["schedule_id"].astype(int).tolist()
-        rank_map = {
-            int(r["schedule_id"]): int(r["schedule_rank"])
-            for _, r in grp.iterrows()
-        }
-        total_bars_map = {
-            int(r["schedule_id"]): float(r["total_bars"])
-            for _, r in grp.iterrows()
-        }
 
-        # Collect events
+        rank_map = {int(r["schedule_id"]): int(r["schedule_rank"]) for _, r in grp.iterrows()}
+        total_units_map = {int(r["schedule_id"]): float(r[total_col]) for _, r in grp.iterrows()}
+
         ev = events[
-            (events["time_horizon_h"] == horizon)
-            & (events["schedule_id"].isin(sched_ids))
+            (events["time_horizon_h"] == horizon) &
+            (events["schedule_id"].isin(sched_ids))
         ].copy()
+
         if ev.empty:
             continue
 
         ev = ev.sort_values(["schedule_id", "start_h"])
         max_time = float(ev["end_h"].max())
 
-        # --- Task groups are the y-axis rows ---
         bucket_to_y = {b: i for i, b in enumerate(TASK_GROUP_ORDER)}
         y_positions = list(bucket_to_y.values())
         y_labels = list(bucket_to_y.keys())
@@ -420,21 +531,14 @@ def plot_gantt_top5(summary: pd.DataFrame, events: pd.DataFrame):
         n_schedules = len(sched_ids)
         fig_height = max(6, 3 + n_schedules * 3.5)
 
-        fig, axes = plt.subplots(
-            n_schedules, 1,
-            figsize=(26, fig_height),
-            sharex=True
-        )
+        fig, axes = plt.subplots(n_schedules, 1, figsize=(26, fig_height), sharex=True)
         if n_schedules == 1:
             axes = [axes]
 
-        # --- Draw each schedule in its own subplot ---
         for ax, sid in zip(axes, sched_ids):
 
-            ev_s = ev[ev["schedule_id"] == sid].copy()
-            ev_s = ev_s.sort_values("start_h")
+            ev_s = ev[ev["schedule_id"] == sid].sort_values("start_h")
 
-            # Draw bars for this schedule
             for _, r in ev_s.iterrows():
                 start = float(r["start_h"])
                 duration = float(r["duration_h"])
@@ -445,7 +549,14 @@ def plot_gantt_top5(summary: pd.DataFrame, events: pd.DataFrame):
                     continue
 
                 y = bucket_to_y[bucket]
-                color = TASK_GROUP_COLORS[bucket]
+
+                # ----------- PRODUCTION COLORING -----------
+                if bucket == "Production" and task.lower().startswith("produce "):
+                    sku = task.split(" ", 1)[1].strip()
+                    color = SKU_COLORS.get(sku, "#000000")  # fallback black if missing
+                else:
+                    color = TASK_GROUP_COLORS[bucket]
+                # -------------------------------------------
 
                 ax.barh(
                     y,
@@ -456,83 +567,92 @@ def plot_gantt_top5(summary: pd.DataFrame, events: pd.DataFrame):
                     edgecolor="none"
                 )
 
-                # ----- Inline annotations -----
-                label = None
-                if bucket == "Production" and duration >= PROD_ANNOT_THRESHOLD:
-                    if task.lower().startswith("produce "):
-                        label = task.split(" ", 1)[1]  # SKU in Production
-                elif bucket != "Production" and duration >= NONPROD_ANNOT_THRESHOLD:
-                    label = SHORT_GROUP_LABELS.get(bucket)  # CO/WC etc.
-
-                if label:
-                    ax.text(
-                        start + duration / 2,
-                        y,
-                        label,
-                        ha="center",
-                        va="center",
-                        fontsize=9,
-                        color="black"
-                    )
-
-            # Format subplot
             ax.set_yticks(y_positions)
             ax.set_yticklabels(y_labels, fontsize=10)
             ax.grid(axis="x", alpha=0.35)
 
-            # Subplot title
             rank = rank_map.get(sid, "?")
-            tb = total_bars_map.get(sid, 0.0)
+            tu = total_units_map.get(sid, 0.0)
 
+            # Extract SKU sequence for this schedule
+            ev_prod = ev_s[ev_s["task"].str.lower().str.startswith("produce ")]
+            sku_sequence = [
+                t.split(" ", 1)[1].strip()
+                for t in ev_prod["task"].tolist()
+            ]
+            sku_sequence_str = "→".join(sku_sequence[:12]) if sku_sequence else "|"
+
+            # Updated title including production sequence
             ax.set_title(
-                f"Schedule {sid} – Rank #{rank} – Total Bars: {tb:,.0f}",
-                fontsize=13,
+                f"Schedule {sid} – Rank #{rank} – Total Magnums: {tu:,.0f}\n"
+                f"Sequence: {sku_sequence_str}",
+                fontsize=12,
                 loc="left"
             )
 
-        # --- Shared X-axis ticks
-        step = 7 * 24  # weekly ticks
+        # X-axis ticks converted to weeks
+        step = 7 * 24
         xticks = np.arange(0, max_time + step, step)
+        xlabels = [int(x / 168) for x in xticks]
 
-        axes[-1].set_xticks(xticks)
-        axes[-1].set_xlabel("Time [h]")
+        axes[-1].set_xticks(xticks, labels=xlabels)
+        axes[-1].set_xlabel("Time [weeks]")
 
         for lbl in axes[-1].get_xticklabels():
             lbl.set_rotation(90)
             lbl.set_ha("right")
 
-        # --- Global legend (task groups)
-        handles = [
+        # Legend remains by task group (not SKU)
+        # --- Global legends ---
+
+        # 1) Task Group Legend (existing)
+        handles_task = [
             Patch(facecolor=TASK_GROUP_COLORS[b], label=b)
             for b in TASK_GROUP_ORDER
         ]
-        fig.legend(
-            handles,
-            [h.get_label() for h in handles],
+
+        task_legend = fig.legend(
+            handles_task,
+            [h.get_label() for h in handles_task],
             loc="upper left",
             bbox_to_anchor=(0.80, 0.98),
             fontsize=10,
             title="Task Groups",
-            frameon=True
+            frameon=True,
         )
 
-        # --- Figure title ---
+        # 2) SKU legend for production colors (new)
+        handles_sku = [
+            Patch(facecolor=col, label=sku)
+            for sku, col in SKU_COLORS.items()
+        ]
+
+        sku_legend = fig.legend(
+            handles_sku,
+            [h.get_label() for h in handles_sku],
+            loc="upper left",
+            bbox_to_anchor=(0.80, 0.55),
+            fontsize=9,
+            title="SKU Production Colors",
+            frameon=True,
+        )
+
+        # Ensure both legends are drawn
+        fig.add_artist(task_legend)
+        fig.add_artist(sku_legend)
+
         fig.suptitle(
-            f"Gantt Timelines – Top {TOP_K} Schedules (Horizon {int(horizon)} h)",
+            f"Gantt Timelines – Top {TOP_K} Schedules (Horizon {int(horizon/168)} weeks)",
             fontsize=18
         )
 
         fig.tight_layout(rect=[0.02, 0.02, 0.78, 0.94])
 
-        out_name = os.path.join(
-            OUTPUT_DIR, f"gantt_top5_horizon_{int(horizon)}h.png"
-        )
+        out_name = os.path.join(OUTPUT_DIR, f"gantt_top5_horizon_{int(horizon)}h.png")
         fig.savefig(out_name, dpi=250)
         plt.close(fig)
 
         print("[saved]", out_name)
-
-
 
 
 
